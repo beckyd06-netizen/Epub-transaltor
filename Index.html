@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>EPUB Translator iPad</title>
+<style>
+:root{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display",system-ui,sans-serif;color-scheme:light dark}
+body{margin:0;background:#f4f4f7;color:#111}
+.wrap{max-width:760px;margin:auto;padding:22px}
+.card{background:#fff;border-radius:22px;padding:20px;box-shadow:0 8px 30px #00000012;margin:14px 0}
+h1{font-size:28px;margin:4px 0 6px}.sub{color:#666;margin:0 0 18px;line-height:1.45}
+.drop{border:2px dashed #aaa;border-radius:18px;padding:28px 14px;text-align:center}
+button,.filebtn{border:0;border-radius:14px;padding:13px 16px;font-weight:700;font-size:15px;background:#111;color:#fff;display:inline-block}
+button:disabled{opacity:.35}.secondary{background:#e8e8ed;color:#111}
+input[type=file]{display:none}
+.row{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
+progress{width:100%;height:16px;margin-top:14px}
+#log{white-space:pre-wrap;font:13px ui-monospace,SFMono-Regular,Menlo,monospace;background:#f5f5f7;border-radius:14px;padding:12px;max-height:180px;overflow:auto}
+.small{font-size:13px;color:#666;line-height:1.45}
+.badge{display:inline-block;background:#eee;border-radius:999px;padding:6px 10px;font-size:12px;font-weight:700}
+@media(prefers-color-scheme:dark){body{background:#000;color:#fff}.card{background:#1c1c1e}.sub,.small{color:#aaa}.secondary{background:#333;color:#fff}#log{background:#111}.badge{background:#333}}
+</style>
+</head>
+<body><div class="wrap">
+<div class="card">
+<span class="badge">iPad • Tanpa API key</span>
+<h1>EPUB Translator</h1>
+<p class="sub">Terjemahkan EPUB Inggris → Indonesia langsung di Safari. Model berjalan di perangkat; file buku tidak diunggah ke server penerjemah.</p>
+<div id="drop" class="drop">
+  <p><b>Pilih EPUB dari Files</b></p>
+  <label class="filebtn" for="file">Pilih EPUB</label>
+  <input id="file" type="file" accept=".epub,application/epub+zip">
+  <p id="fname" class="small">Belum ada file.</p>
+</div>
+<div class="row">
+<button id="start" disabled>Mulai Terjemahkan</button>
+<button id="pause" class="secondary" disabled>Pause</button>
+<button id="save" class="secondary" disabled>Simpan EPUB</button>
+</div>
+<progress id="progress" value="0" max="100"></progress>
+<p id="status" class="small">Siap.</p>
+</div>
+
+<div class="card">
+<b>Pengaturan</b>
+<p class="small">Mode dibuat untuk novel: struktur bab, paragraf, italic/bold, dan gambar dipertahankan. Terjemahan lokal cenderung lebih natural daripada word-by-word, tetapi kualitas tetap bisa berbeda dari model AI cloud.</p>
+<label class="small">Batch: <select id="batch"><option>4</option><option selected>8</option><option>12</option></select> bagian sekaligus</label>
+</div>
+
+<div class="card">
+<b>Log</b>
+<div id="log">Menunggu EPUB…</div>
+</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<script type="module">
+import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.2';
+env.allowLocalModels = false;
+
+const $=id=>document.getElementById(id);
+let inputFile=null, outputBlob=null, paused=false, translator=null;
+const log=(s)=>{ $('log').textContent += "\n"+s; $('log').scrollTop=$('log').scrollHeight; };
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+
+$('file').onchange=e=>{
+ inputFile=e.target.files[0]||null;
+ $('fname').textContent=inputFile?inputFile.name:'Belum ada file.';
+ $('start').disabled=!inputFile;
+ outputBlob=null;$('save').disabled=true;$('progress').value=0;
+};
+const drop=$('drop');
+drop.ondragover=e=>{e.preventDefault()};
+drop.ondrop=e=>{e.preventDefault(); const f=e.dataTransfer.files[0]; if(f&&f.name.toLowerCase().endsWith('.epub')){inputFile=f;$('fname').textContent=f.name;$('start').disabled=false;}};
+
+$('pause').onclick=()=>{
+ paused=!paused;
+ $('pause').textContent=paused?'Lanjutkan':'Pause';
+ $('status').textContent=paused?'Dijeda.':'Melanjutkan…';
+};
+
+function translatableTextNodes(doc){
+ const walker=doc.createTreeWalker(doc.documentElement,NodeFilter.SHOW_TEXT);
+ const out=[]; let n;
+ while(n=walker.nextNode()){
+   const p=n.parentElement;
+   if(!p || ['SCRIPT','STYLE','TITLE'].includes(p.tagName)) continue;
+   const t=n.nodeValue;
+   if(t && /[A-Za-z]/.test(t) && t.trim().length>1) out.push(n);
+ }
+ return out;
+}
+function clean(s){return s.replace(/\s+/g,' ').trim();}
+function preserveSpace(oldText,newText){
+ const a=/^\s/.test(oldText)?' ':'', b=/\s$/.test(oldText)?' ':'';
+ return a+newText.trim()+b;
+}
+async function getTranslator(){
+ if(translator) return translator;
+ $('status').textContent='Mengunduh model terjemahan pertama kali…';
+ log('Mengunduh model lokal Inggris → Indonesia. Ini hanya perlu pertama kali.');
+ translator=await pipeline('translation','Xenova/opus-mt-en-id',{device:'wasm'});
+ log('Model siap.');
+ return translator;
+}
+
+$('start').onclick=async()=>{
+ if(!inputFile)return;
+ try{
+  $('start').disabled=true;$('pause').disabled=false;$('save').disabled=true;
+  paused=false;$('pause').textContent='Pause';outputBlob=null;
+  const tr=await getTranslator();
+  $('status').textContent='Membuka EPUB…';
+  const zip=await JSZip.loadAsync(await inputFile.arrayBuffer());
+  const files=Object.keys(zip.files).filter(n=>/\.(xhtml|html|htm)$/i.test(n) && !zip.files[n].dir);
+  if(!files.length) throw new Error('Tidak menemukan halaman XHTML/HTML di EPUB.');
+  log(`Ditemukan ${files.length} file isi buku.`);
+  let jobs=[];
+  for(const name of files){
+    const text=await zip.file(name).async('string');
+    const doc=new DOMParser().parseFromString(text,'application/xhtml+xml');
+    if(doc.querySelector('parsererror')) continue;
+    const nodes=translatableTextNodes(doc);
+    jobs.push({name,text,doc,nodes});
+  }
+  const total=jobs.reduce((a,j)=>a+j.nodes.length,0);
+  let done=0, bs=Number($('batch').value);
+  log(`Bagian teks yang akan diproses: ${total}.`);
+  for(const job of jobs){
+    for(let i=0;i<job.nodes.length;i+=bs){
+      while(paused) await sleep(350);
+      const nodes=job.nodes.slice(i,i+bs);
+      const src=nodes.map(n=>clean(n.nodeValue)).filter(Boolean);
+      if(!src.length) continue;
+      $('status').textContent=`Menerjemahkan… ${Math.round(done/Math.max(total,1)*100)}%`;
+      let res=await tr(src,{max_new_tokens:256});
+      if(!Array.isArray(res))res=[res];
+      nodes.forEach((n,k)=>{
+        const translated=res[k]?.translation_text;
+        if(translated) n.nodeValue=preserveSpace(n.nodeValue,translated);
+      });
+      done+=nodes.length;
+      $('progress').value=Math.round(done/Math.max(total,1)*100);
+      await sleep(0);
+    }
+    const serialized=new XMLSerializer().serializeToString(job.doc);
+    zip.file(job.name,serialized);
+  }
+  $('status').textContent='Membuat EPUB hasil…';
+  // EPUB spec: mimetype must be first and stored, not deflated.
+  const out=new JSZip();
+  if(zip.file('mimetype')) out.file('mimetype',await zip.file('mimetype').async('string'),{compression:'STORE'});
+  for(const name of Object.keys(zip.files)){
+    if(name==='mimetype')continue;
+    const f=zip.files[name];
+    if(f.dir){out.folder(name);continue;}
+    out.file(name,await f.async('uint8array'),{compression:'DEFLATE'});
+  }
+  outputBlob=await out.generateAsync({type:'blob',mimeType:'application/epub+zip',compression:'DEFLATE'});
+  $('progress').value=100;$('status').textContent='Selesai. Tekan “Simpan EPUB”.';
+  $('save').disabled=false;$('pause').disabled=true;log('✓ EPUB terjemahan selesai.');
+ }catch(err){
+  console.error(err); $('status').textContent='Gagal: '+err.message; log('ERROR: '+err.message);
+ }finally{$('start').disabled=false;}
+};
+
+$('save').onclick=()=>{
+ if(!outputBlob)return;
+ const base=inputFile.name.replace(/\.epub$/i,'');
+ const a=document.createElement('a');
+ a.href=URL.createObjectURL(outputBlob);
+ a.download=base+' - Indonesia.epub';
+ document.body.appendChild(a);a.click();a.remove();
+ setTimeout(()=>URL.revokeObjectURL(a.href),30000);
+};
+</script>
+</body></html>
